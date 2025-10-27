@@ -1,0 +1,93 @@
+name: RDP (12 Hour Session)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 720  # 12 hours
+
+    steps:
+      - name: Enable RDP Access
+        run: |
+          Write-Host "🔧 Enabling Remote Desktop..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service -Name TermService -Force
+          Write-Host "✅ RDP service enabled!"
+
+      - name: Create RDP User
+        run: |
+          Write-Host "👤 Creating local RDP user..."
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+          }
+          $raw = @()
+          $raw += $charSet.Upper | Get-Random -Count 4
+          $raw += $charSet.Lower | Get-Random -Count 4
+          $raw += $charSet.Number | Get-Random -Count 4
+          $raw += $charSet.Special | Get-Random -Count 4
+          $password = -join ($raw | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+          Write-Host "✅ User 'RDP' created with random secure password."
+
+      - name: Install and Connect Tailscale
+        run: |
+          Write-Host "🌐 Installing Tailscale..."
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $file = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $url -OutFile $file
+          Start-Process msiexec.exe -ArgumentList "/i `"$file`" /quiet /norestart" -Wait
+          Remove-Item $file -Force
+
+          Write-Host "🔗 Connecting to Tailscale..."
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-rdp-${{ github.run_id }}
+
+          Start-Sleep -Seconds 10
+          $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          if (-not $tsIP) {
+              Write-Error "❌ Failed to get Tailscale IP."
+              exit 1
+          }
+          echo "TS_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "✅ Tailscale connected. IP: $tsIP"
+
+      - name: Verify RDP Port
+        run: |
+          Write-Host "🧪 Testing RDP connectivity..."
+          $res = Test-NetConnection -ComputerName $env:TS_IP -Port 3389
+          if (-not $res.TcpTestSucceeded) {
+              Write-Error "❌ RDP Port 3389 not reachable."
+              exit 1
+          }
+          Write-Host "✅ RDP Port 3389 is open and reachable via Tailscale."
+
+      - name: Display Connection Info & Keep Alive
+        run: |
+          Write-Host ""
+          Write-Host "================ RDP CONNECTION DETAILS ================"
+          Write-Host "🖥️  Address : $env:TS_IP"
+          Write-Host "👤 Username: $env:RDP_USER"
+          Write-Host "🔑 Password: $env:RDP_PASS"
+          Write-Host "========================================================"
+          Write-Host ""
+          Write-Host "Keep this workflow running to maintain RDP session."
+          Write-Host "Press Ctrl + C in Actions UI to stop manually."
+          Write-Host ""
+          while ($true) {
+              Write-Host "[$(Get-Date)] 🔁 RDP session active..."
+              Start-Sleep -Seconds 300
+          }
